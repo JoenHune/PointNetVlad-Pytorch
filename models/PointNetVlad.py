@@ -9,6 +9,85 @@ import torch.nn.functional as F
 import math
 
 
+class OffsetAttention(nn.Module):
+    def __init__(self, channels, eps=1e-9):
+        super(OffsetAttention, self).__init__()
+        # query
+        self.q_conv = nn.Conv1d(channels, channels // 4, kernel_size=1, bias=False)
+        # key
+        self.k_conv = nn.Conv1d(channels, channels // 4, kernel_size=1, bias=False)
+        # shared-weights
+        self.q_conv.weight = self.k_conv.weight
+        # value
+        self.v_conv = nn.Conv1d(channels, channels, kernel_size=1)
+        # transfer
+        self.t_conv = nn.Conv1d(channels, channels, kernel_size=1)
+        # batch norm
+        self.bn = nn.BatchNorm1d(channels)
+
+        self.eps = eps
+
+    def forward(self, x):
+        # batch_size, channels, num_points
+        # B, C, N = x.shape
+
+        # b, c, n -> b, c//4, n -> b, n, c//4
+        query = self.q_conv(x).permute(0, 2, 1)
+        # b, c, n -> b, c//4, n
+        key = self.k_conv(x)
+        # b, c, n -> b, c, n
+        value = self.v_conv(x)
+
+        # b, n, n
+        energy = torch.bmm(query, key)
+        attention = nn.Softmax(dim=-1)(energy)
+        attention = attention / (self.eps + attention.sum(dim=1, keepdim=True))
+
+        # b, c, n
+        y = torch.bmm(value, attention)
+        y = nn.Softmax(dim=-1)(self.bn(self.t_conv(x - y)))
+        x = x + y
+
+        return x
+
+
+class PointCloudTransformer(nn.Module):
+    def __init__(self, in_channels=3, channels=256):
+        super(PointCloudTransformer, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, channels, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.bn2 = nn.BatchNorm1d(channels)
+
+        self.oa1 = OffsetAttention(channels)
+        self.oa2 = OffsetAttention(channels)
+        self.oa3 = OffsetAttention(channels)
+        self.oa4 = OffsetAttention(channels)
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # batch_size, 3, num_points
+        # B, C, N = x.shape
+
+        # b, 3, n -> b, c, n
+        x = self.relu(self.bn1(self.conv1(x)))
+        # b, c, n -> b, c, n
+        x = self.relu(self.bn2(self.conv2(x)))
+
+        # b, c, n
+        f1 = self.oa1(x)
+        f2 = self.oa2(f1)
+        f3 = self.oa3(f2)
+        f4 = self.oa4(f3)
+
+        # b, 4c, n
+        y = torch.cat((f1, f2, f3, f4), dim=1)
+
+        return y
+    
+
 class NetVLADLoupe(nn.Module):
     def __init__(self, feature_size, max_samples, cluster_size, output_dim,
                  gating=True, add_batch_norm=True, is_training=True):
@@ -68,7 +147,7 @@ class NetVLADLoupe(nn.Module):
         vlad = vlad - a
 
         vlad = F.normalize(vlad, dim=1, p=2)
-        vlad = vlad.view((-1, self.cluster_size * self.feature_size))
+        vlad = vlad.reshape((-1, self.cluster_size * self.feature_size))
         vlad = F.normalize(vlad, dim=1, p=2)
 
         vlad = torch.matmul(vlad, self.hidden1_weights)
@@ -246,7 +325,23 @@ class PointNetVlad(nn.Module):
         x = self.net_vlad(x)
         return x
 
+    
+class TransNetVLAD(nn.Module):
+    """
+    TransNetVLAD
+    adapt from: https://github.com/cattaneod/PointNetVlad-Pytorch/blob/master/models/PointNetVlad.py
+    """
 
+    def __init__(self, num_points=2500, global_feat=True, feature_transform=False, max_pool=True, output_dim=1024):
+        super(TransNetVLAD, self).__init__()
+        self.transformer = PointCloudTransformer(in_channels=3, channels=256)
+        self.netvlad = NetVLAD(feature_size=1024, max_samples=num_points, cluster_size=64, output_dim=output_dim,
+                               gating=True, add_batch_norm=True)
+
+    def forward(self, x):
+        return self.netvlad(self.transformer(x))
+
+    
 if __name__ == '__main__':
     num_points = 4096
     sim_data = Variable(torch.rand(44, 1, num_points, 3))
